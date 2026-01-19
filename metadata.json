@@ -1,0 +1,5 @@
+{
+  "name": "TJPR AI Demand Prioritizer",
+  "description": "An intelligent project management tool for the Court of Justice of Paraná (TJPR) to structure, categorize, and prioritize unstructured demands based on critical operational matrices.",
+  "requestFramePermissions": []
+}
