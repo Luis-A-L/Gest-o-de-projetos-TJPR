@@ -1246,7 +1246,7 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
               </div>
 
               <p className="text-[10px] text-center text-slate-400">
-                *O e-mail será enviado automaticamente
+                *A notificação será enviada para o responsável!
               </p>
             </form>
           </div>
