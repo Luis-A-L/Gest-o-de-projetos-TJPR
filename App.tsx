@@ -75,6 +75,14 @@ const App: React.FC = () => {
   // Notification / Toast System
   const [notification, setNotification] = useState<{message: string, type: 'success' | 'loading' | 'error'} | null>(null);
 
+  // --- PERSISTENCE: Check LocalStorage on Mount ---
+  useEffect(() => {
+    const savedSession = localStorage.getItem('tjpr_session');
+    if (savedSession) {
+      setCurrentUser(JSON.parse(savedSession));
+    }
+  }, []);
+
   useEffect(() => {
     if (notification && (notification.type === 'success' || notification.type === 'error')) {
       const timer = setTimeout(() => {
@@ -90,7 +98,7 @@ const App: React.FC = () => {
         fetchTasks();
         fetchNotifications();
 
-        // Subscribe to Realtime Notifications
+        // --- REALTIME SUBSCRIPTIONS ---
         const subscription = supabase
           .channel('public:notifications')
           .on('postgres_changes', { 
@@ -104,8 +112,57 @@ const App: React.FC = () => {
           })
           .subscribe();
 
+        // Realtime Tasks (Updates & Inserts)
+        const tasksSubscription = supabase
+          .channel('public:tasks')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks' }, (payload) => {
+             if (payload.eventType === 'INSERT') {
+                // Logic handled by optimistic update usually, but good to sync
+                // For simplicity in this view, we might want to refetch or append if not exists
+                // fetchTasks(); // Brute force sync for simplicity on INSERT
+             } else if (payload.eventType === 'UPDATE') {
+                setTasks(prev => prev.map(t => {
+                    if (t.id === payload.new.id) {
+                        return { 
+                            ...t, 
+                            ...payload.new,
+                            // Preserve comments and mapped fields that might differ in structure
+                            category: payload.new.category as Category,
+                            priority: payload.new.priority as PriorityLevel,
+                            createdAt: new Date(payload.new.created_at).getTime(),
+                            comments: t.comments // Keep existing comments
+                        };
+                    }
+                    return t;
+                }));
+             }
+          })
+          .subscribe();
+
+        // Realtime Comments
+        const commentsSubscription = supabase
+          .channel('public:comments')
+          .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'comments' }, (payload) => {
+             const newCommentRaw = payload.new;
+             const newComment: Comment = {
+                 id: newCommentRaw.id,
+                 author: newCommentRaw.author,
+                 text: newCommentRaw.text,
+                 createdAt: new Date(newCommentRaw.created_at).getTime()
+             };
+
+             setTasks(prev => prev.map(t => 
+                 t.id === newCommentRaw.task_id 
+                 ? { ...t, comments: [...t.comments, newComment] }
+                 : t
+             ));
+          })
+          .subscribe();
+
         return () => {
           supabase.removeChannel(subscription);
+          supabase.removeChannel(tasksSubscription);
+          supabase.removeChannel(commentsSubscription);
         };
     }
   }, [currentUser]);
@@ -151,9 +208,10 @@ const App: React.FC = () => {
           priority: t.priority as PriorityLevel,
           justification: t.justification,
           project: t.project,
-          assignee: t.assignee,
+          assignees: t.assignees || (t.assignee ? [t.assignee] : []),
           createdAt: new Date(t.created_at).getTime(),
           status: t.status || 'PENDING',
+          progress: t.progress || 0,
           comments: t.comments ? t.comments.map((c: any) => ({
             id: c.id,
             author: c.author,
@@ -179,10 +237,12 @@ const App: React.FC = () => {
 
   const handleLoginSuccess = (session: UserSession) => {
     setCurrentUser(session);
+    localStorage.setItem('tjpr_session', JSON.stringify(session));
   };
 
   const handleLogout = () => {
     setCurrentUser(null);
+    localStorage.removeItem('tjpr_session');
     setTasks([]);
   };
 
@@ -255,6 +315,27 @@ const App: React.FC = () => {
       .eq('id', id);
   };
 
+  const handleDeleteNotification = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setNotificationsList(prev => prev.filter(n => n.id !== id));
+    await supabase
+      .from('notifications')
+      .delete()
+      .eq('id', id);
+  };
+
+  const handleClearAllNotifications = async () => {
+    if (!currentUser) return;
+    if (window.confirm('Tem certeza que deseja apagar todas as notificações?')) {
+        setNotificationsList([]);
+        await supabase.from('notifications').delete().eq('user_email', currentUser.email);
+    }
+  };
+
+  const handleAddProject = (newProject: string) => {
+    setProjects(prev => Array.from(new Set([...prev, newProject])));
+  };
+
   const handleAddTask = async (newTask: Task) => {
     try {
       setNotification({ type: 'loading', message: 'Salvando demanda...' });
@@ -267,7 +348,9 @@ const App: React.FC = () => {
           priority: newTask.priority,
           justification: newTask.justification,
           project: newTask.project,
-          assignee: newTask.assignee
+          assignees: newTask.assignees,
+          assignee: newTask.assignees[0], // Preenche coluna legada para evitar erro de constraint
+          progress: 0
         }])
         .select()
         .single();
@@ -279,35 +362,33 @@ const App: React.FC = () => {
             ...newTask,
             id: data.id,
             createdAt: new Date(data.created_at).getTime(),
+            progress: 0,
             comments: []
         };
         
         setTasks(prev => [createdTask, ...prev]);
         
-        // Find email for assignee
-        let assigneeEmail = 'usuario@tjpr.jus.br';
-        const assigneeEntry = Object.entries(ALLOWED_USERS).find(([email, u]) => u.name === newTask.assignee);
-        if (assigneeEntry) {
-            assigneeEmail = assigneeEntry[0];
-        }
+        // Find emails for assignees
 
-        // Send In-App Notification (Substituindo ou complementando o email)
-        await sendInAppNotification(
-          assigneeEmail,
-          `Nova Demanda: ${newTask.title}`,
-          `Você foi atribuído ao projeto "${newTask.project}" com prioridade ${newTask.priority}.`
-        );
+        const assigneeEmails = newTask.assignees.map(name => {
+            const entry = Object.entries(ALLOWED_USERS).find(([email, u]) => u.name === name);
+            return entry ? entry[0] : null;
+        }).filter(Boolean) as string[];
+
+        for (const email of assigneeEmails) {
+            await sendInAppNotification(
+              email,
+              `Nova Demanda: ${newTask.title}`,
+              `Você foi atribuído ao projeto "${newTask.project}" com prioridade ${newTask.priority}.`
+            );
+        }
 
         setNotification({ type: 'success', message: 'Demanda criada e responsável notificado.' });
       }
     } catch (err) {
       console.error("Error adding task:", err);
-      setNotification({ type: 'error', message: 'Erro ao criar tarefa.' });
+      setNotification({ type: 'error', message: `Erro ao criar tarefa: ${(err as any).message}` });
     }
-  };
-
-  const handleAddProject = (newProject: string) => {
-    setProjects(prev => Array.from(new Set([...prev, newProject])));
   };
 
   const handleToggleTaskStatus = async (task: Task) => {
@@ -332,6 +413,37 @@ const App: React.FC = () => {
         // Revert
         setTasks(prev => prev.map(t => t.id === task.id ? { ...t, status: task.status } : t));
         setNotification({ type: 'error', message: 'Erro ao atualizar status.' });
+    }
+  };
+
+  const handleUpdateProgress = async (task: Task, newProgress: number) => {
+    const oldProgress = task.progress || 0;
+    
+    // Regra de Negócio: Aviso se diminuir
+    if (newProgress < oldProgress) {
+        setNotification({ type: 'error', message: 'Atenção: Ao reduzir o progresso, por favor justifique nos comentários.' });
+    }
+
+    // Optimistic Update
+    setTasks(prev => prev.map(t => t.id === task.id ? { ...t, progress: newProgress } : t));
+
+    try {
+        const { error } = await supabase
+            .from('tasks')
+            .update({ progress: newProgress })
+            .eq('id', task.id);
+
+        if (error) throw error;
+        
+        if (newProgress === 100 && task.status !== 'DONE') {
+             // Opcional: Perguntar se quer marcar como concluído
+             handleToggleTaskStatus(task);
+        }
+
+    } catch (err) {
+        console.error("Error updating progress:", err);
+        setTasks(prev => prev.map(t => t.id === task.id ? { ...t, progress: oldProgress } : t));
+        setNotification({ type: 'error', message: `Erro ao atualizar progresso: ${(err as any).message}` });
     }
   };
 
@@ -389,26 +501,25 @@ const App: React.FC = () => {
 
             const task = tasks.find(t => t.id === taskId);
             if (task) {
-                let recipientEmail = '';
-                let recipientName = '';
+                const recipients: {email: string, name: string}[] = [];
 
                 if (currentUser.role === 'BOSS') {
-                    // Boss commented -> Notify Employee
-                    const assigneeEntry = Object.entries(ALLOWED_USERS).find(([email, u]) => u.name === task.assignee);
-                    if (assigneeEntry) {
-                        recipientEmail = assigneeEntry[0];
-                        recipientName = task.assignee;
-                    }
+                    // Boss commented -> Notify All Assignees
+                    task.assignees.forEach(assigneeName => {
+                        const entry = Object.entries(ALLOWED_USERS).find(([email, u]) => u.name === assigneeName);
+                        if (entry) {
+                            recipients.push({ email: entry[0], name: assigneeName });
+                        }
+                    });
                 } else {
                     // Employee commented -> Notify Boss
-                    recipientEmail = BOSS_EMAIL;
-                    recipientName = "Rodrigo Louzano";
+                    recipients.push({ email: BOSS_EMAIL, name: "Rodrigo Louzano" });
                 }
-
-                if (recipientEmail) {
+                
+                for (const recipient of recipients) {
                    // Send In-App Notification
                    await sendInAppNotification(
-                      recipientEmail,
+                      recipient.email,
                       `Novo Comentário em: ${task.title}`,
                       `${currentUser.name} comentou: "${text}"`
                    );
@@ -426,24 +537,26 @@ const App: React.FC = () => {
       setNotification({ type: 'error', message: 'Não há tarefas para gerar relatório.' });
       return;
     }
-
-    const headers = ['ID', 'Título', 'Projeto', 'Categoria', 'Prioridade', 'Nome do Usuário', 'E-mail', 'Status', 'Criado em', 'Justificativa'];
+    const headers = ['ID', 'Título', 'Projeto', 'Categoria', 'Prioridade', 'Responsáveis', 'E-mails', 'Status', 'Progresso (%)', 'Criado em', 'Justificativa'];
     const csvContent = [
-      headers.join(','),
+      headers.join(';'),
       ...tasks.map(t => {
-        const assigneeEmail = Object.entries(ALLOWED_USERS).find(([email, u]) => u.name === t.assignee)?.[0] || '';
+        const assigneeEmails = t.assignees.map(name => 
+            Object.entries(ALLOWED_USERS).find(([email, u]) => u.name === name)?.[0] || ''
+        ).filter(Boolean).join(', ');
         return [
         t.id,
         `"${t.title.replace(/"/g, '""')}"`,
         `"${t.project.replace(/"/g, '""')}"`,
         t.category,
         t.priority,
-        t.assignee,
-        assigneeEmail,
+        `"${t.assignees.join(', ')}"`,
+        `"${assigneeEmails}"`,
         t.status,
+        t.progress || 0,
         new Date(t.createdAt).toLocaleDateString(),
         `"${t.justification.replace(/"/g, '""')}"`
-      ].join(',')})
+      ].join(';')})
     ].join('\n');
 
     const blob = new Blob(["\uFEFF" + csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -466,10 +579,9 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-900 flex flex-col relative">
-      
       {/* Toast Notification */}
       {notification && (
-        <div className="fixed bottom-6 right-6 z-50 animate-in slide-in-from-right-10 fade-in duration-300">
+        <div className="fixed bottom-6 right-6 z-[60] animate-in slide-in-from-right-10 fade-in duration-300">
           <div className={`px-4 py-3 rounded-xl shadow-xl shadow-slate-200/50 flex items-center gap-3 max-w-md border-l-4 ${
               notification.type === 'loading' ? 'bg-blue-800 border-blue-400 text-white' : 
               notification.type === 'error' ? 'bg-red-800 border-red-400 text-white' :
@@ -524,7 +636,12 @@ const App: React.FC = () => {
                 {showNotificationsPanel && (
                   <div className="absolute right-0 mt-2 w-80 bg-white rounded-xl shadow-xl border border-slate-200 overflow-hidden z-50 animate-in fade-in slide-in-from-top-2 text-slate-800">
                     <div className="p-3 border-b border-slate-100 flex justify-between items-center bg-slate-50">
-                      <h3 className="text-xs font-bold text-slate-600 uppercase tracking-wider">Notificações</h3>
+                      <div className="flex items-center gap-2">
+                          <h3 className="text-xs font-bold text-slate-600 uppercase tracking-wider">Notificações</h3>
+                          {notificationsList.length > 0 && (
+                              <button onClick={handleClearAllNotifications} className="text-[10px] text-red-500 hover:text-red-700 font-medium underline">Limpar tudo</button>
+                          )}
+                      </div>
                       <button onClick={() => setShowNotificationsPanel(false)}><X className="w-4 h-4 text-slate-400 hover:text-slate-600" /></button>
                     </div>
                     <div className="max-h-80 overflow-y-auto custom-scrollbar">
@@ -532,13 +649,21 @@ const App: React.FC = () => {
                         <div className="p-6 text-center text-slate-400 text-xs italic">Nenhuma notificação.</div>
                       ) : (
                         notificationsList.map(notif => (
-                          <div key={notif.id} onClick={() => handleMarkAsRead(notif.id)} className={`p-3 border-b border-slate-50 hover:bg-slate-50 cursor-pointer transition-colors ${!notif.read ? 'bg-blue-50/50' : ''}`}>
-                            <div className="flex justify-between items-start mb-1">
+                          <div key={notif.id} onClick={() => handleMarkAsRead(notif.id)} className={`p-3 border-b border-slate-50 hover:bg-slate-50 cursor-pointer transition-colors group relative ${!notif.read ? 'bg-blue-50/50' : ''}`}>
+                            <div className="flex justify-between items-start mb-1 pr-6">
                               <h4 className={`text-sm ${!notif.read ? 'font-bold text-blue-900' : 'font-medium text-slate-700'}`}>{notif.title}</h4>
                               {!notif.read && <span className="w-2 h-2 bg-blue-500 rounded-full mt-1.5"></span>}
                             </div>
                             <p className="text-xs text-slate-500 line-clamp-2">{notif.message}</p>
                             <span className="text-[10px] text-slate-400 mt-1 block">{new Date(notif.created_at).toLocaleDateString()}</span>
+                            
+                            <button 
+                                onClick={(e) => handleDeleteNotification(notif.id, e)}
+                                className="absolute top-3 right-3 p-1 text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity"
+                                title="Apagar notificação"
+                            >
+                                <Trash2 className="w-3.5 h-3.5" />
+                            </button>
                           </div>
                         ))
                       )}
@@ -575,7 +700,7 @@ const App: React.FC = () => {
         
         {/* Left Panel */}
         <div className="lg:col-span-3 space-y-6">
-            <CreateTaskForm onAddTask={handleAddTask} projects={projects} onAddProject={handleAddProject} />
+            <CreateTaskForm onAddTask={handleAddTask} projects={projects} onAddProject={handleAddProject} currentUser={currentUser} />
             
             {currentUser.role === 'BOSS' ? (
                 <ReportPanel onGenerate={generateReport} />
@@ -606,6 +731,7 @@ const App: React.FC = () => {
                     onAddComment={handleAddComment}
                     currentUser={currentUser}
                     onToggleStatus={handleToggleTaskStatus}
+                    onUpdateProgress={handleUpdateProgress}
                 />
             )}
         </div>
@@ -741,8 +867,9 @@ const LoginScreen: React.FC<{ onLoginSuccess: (session: UserSession) => void }> 
     };
 
     return (
-        <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4">
-            <div className="bg-white rounded-2xl shadow-xl max-w-4xl w-full overflow-hidden flex flex-col md:flex-row min-h-[500px]">
+        <div className="min-h-screen bg-slate-100 flex flex-col items-center justify-center p-4">
+            <div className="flex-1 flex items-center justify-center w-full max-w-4xl">
+            <div className="bg-white rounded-2xl shadow-xl w-full overflow-hidden flex flex-col md:flex-row min-h-[500px]">
                 
                 {/* Branding Side */}
                 <div className="bg-blue-900 p-12 text-white md:w-1/2 flex flex-col justify-center relative overflow-hidden">
@@ -897,27 +1024,31 @@ const LoginScreen: React.FC<{ onLoginSuccess: (session: UserSession) => void }> 
 
                 </div>
             </div>
+            </div>
         </div>
     );
 };
 
-const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[], onAddProject: (p: string) => void }> = ({ onAddTask, projects, onAddProject }) => {
+const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[], onAddProject: (p: string) => void, currentUser: UserSession }> = ({ onAddTask, projects, onAddProject, currentUser }) => {
     // Determine the list of assignees based on the ALLOWED_USERS constant
     const ASSIGNEES = Object.values(ALLOWED_USERS)
         .filter(u => u.role === 'EMPLOYEE')
         .map(u => u.name);
+
+    const defaultAssignee = ASSIGNEES.includes(currentUser.name) ? currentUser.name : (ASSIGNEES[0] || 'Narley');
 
     const [formData, setFormData] = useState({
         title: '',
         category: Category.DEV,
         priority: PriorityLevel.MEDIA,
         project: projects[0] || '',
-        assignee: ASSIGNEES[0] || 'Narley',
+        assignees: [defaultAssignee],
         justification: ''
       });
 
       const [isCreatingProject, setIsCreatingProject] = useState(false);
       const [newProjectName, setNewProjectName] = useState('');
+      const [newProjectStatus, setNewProjectStatus] = useState('Em Desenv.');
     
       const inputClasses = "w-full px-3 py-2 rounded-lg border border-slate-200 text-sm text-slate-900 bg-slate-50 focus:bg-white focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all placeholder:text-slate-400";
 
@@ -931,7 +1062,7 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
           category: formData.category as Category,
           priority: formData.priority as PriorityLevel,
           project: formData.project,
-          assignee: formData.assignee,
+          assignees: formData.assignees,
           justification: formData.justification,
           createdAt: 0,
           comments: []
@@ -944,7 +1075,7 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
             category: Category.DEV,
             priority: PriorityLevel.MEDIA,
             project: projects[0] || '',
-            assignee: ASSIGNEES[0] || 'Narley',
+            assignees: [defaultAssignee],
             justification: ''
         });
       };
@@ -956,11 +1087,25 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
 
       const handleCreateProject = () => {
         if (newProjectName.trim()) {
-            onAddProject(newProjectName);
-            setFormData(prev => ({ ...prev, project: newProjectName }));
+            const finalName = `${newProjectName.trim()} (${newProjectStatus})`;
+            onAddProject(finalName);
+            setFormData(prev => ({ ...prev, project: finalName }));
             setIsCreatingProject(false);
             setNewProjectName('');
+            setNewProjectStatus('Em Desenv.');
         }
+      };
+
+      const toggleAssignee = (name: string) => {
+        setFormData(prev => {
+            const current = prev.assignees;
+            if (current.includes(name)) {
+                if (current.length === 1) return prev; // Prevent empty
+                return { ...prev, assignees: current.filter(a => a !== name) };
+            } else {
+                return { ...prev, assignees: [...current, name] };
+            }
+        });
       };
 
     return (
@@ -983,7 +1128,7 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
                   </label>
                   
                   {isCreatingProject ? (
-                    <div className="flex gap-2">
+                    <div className="flex flex-col gap-2 p-3 bg-slate-50 rounded-lg border border-slate-200 animate-in fade-in zoom-in-95 duration-200">
                         <input 
                             type="text" 
                             value={newProjectName} 
@@ -992,8 +1137,20 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
                             className={inputClasses} 
                             autoFocus
                         />
-                        <button type="button" onClick={handleCreateProject} className="bg-blue-600 text-white px-3 rounded-lg text-xs font-bold hover:bg-blue-700">OK</button>
-                        <button type="button" onClick={() => setIsCreatingProject(false)} className="bg-slate-200 text-slate-600 px-3 rounded-lg text-xs font-bold hover:bg-slate-300"><X className="w-3 h-3" /></button>
+                        <select 
+                            value={newProjectStatus}
+                            onChange={(e) => setNewProjectStatus(e.target.value)}
+                            className={inputClasses}
+                        >
+                            <option value="Em Desenv.">Em Desenvolvimento</option>
+                            <option value="Lançado">Lançado</option>
+                            <option value="Manutenção">Em Manutenção</option>
+                            <option value="Planejamento">Planejamento</option>
+                        </select>
+                        <div className="flex gap-2 justify-end mt-1">
+                            <button type="button" onClick={() => setIsCreatingProject(false)} className="bg-white border border-slate-200 text-slate-600 px-3 py-1.5 rounded-lg text-xs font-bold hover:bg-slate-50">Cancelar</button>
+                            <button type="button" onClick={handleCreateProject} className="bg-blue-600 text-white px-3 py-1.5 rounded-lg text-xs font-bold hover:bg-blue-700 shadow-sm">Criar Projeto</button>
+                        </div>
                     </div>
                   ) : (
                     <div className="flex gap-2">
@@ -1009,9 +1166,18 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
                   <label className="block text-xs font-semibold text-slate-600 mb-1.5 flex items-center gap-1">
                     <User className="w-3 h-3" /> Responsável
                   </label>
-                  <select name="assignee" value={formData.assignee} onChange={handleInputChange} className={inputClasses}>
-                    {ASSIGNEES.map(m => <option key={m} value={m}>{m}</option>)}
-                  </select>
+                  <div className="flex flex-wrap gap-2">
+                    {ASSIGNEES.map(name => (
+                        <button
+                            type="button"
+                            key={name}
+                            onClick={() => toggleAssignee(name)}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-all flex items-center gap-1 ${formData.assignees.includes(name) ? 'bg-blue-100 text-blue-700 border-blue-200' : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
+                        >
+                            {name} {formData.assignees.includes(name) && <Check className="w-3 h-3" />}
+                        </button>
+                    ))}
+                  </div>
                 </div>
               </div>
 
@@ -1033,8 +1199,14 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1.5">Justificativa / Detalhes</label>
-                <textarea name="justification" value={formData.justification} onChange={handleInputChange} rows={3} placeholder="Descreva o motivo..." className={`${inputClasses} resize-none`} />
+                <label className="block text-xs font-semibold text-slate-600 mb-1.5">Descrição / Justificativa</label>
+                <textarea 
+                    name="justification" 
+                    value={formData.justification} 
+                    onChange={handleInputChange} 
+                    placeholder="Descreva os detalhes da demanda..." 
+                    className={`${inputClasses} min-h-[80px] resize-y`} 
+                />
               </div>
 
               <div className="flex flex-col gap-3">
@@ -1053,8 +1225,8 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
 };
 
 const EmployeeInfoPanel: React.FC<{ user: UserSession, tasks: Task[] }> = ({ user, tasks }) => {
-    const myTasks = tasks.filter(t => t.assignee === user.name && t.status !== 'DONE');
-    const completedTasks = tasks.filter(t => t.assignee === user.name && t.status === 'DONE').length;
+    const myTasks = tasks.filter(t => t.assignees.includes(user.name) && t.status !== 'DONE');
+    const completedTasks = tasks.filter(t => t.assignees.includes(user.name) && t.status === 'DONE').length;
     
     const oldestTask = [...myTasks].sort((a, b) => a.createdAt - b.createdAt)[0];
     const high = myTasks.filter(t => t.priority === PriorityLevel.ALTA).length;
@@ -1132,7 +1304,7 @@ const TeamWorkloadPanel: React.FC<{ tasks: Task[] }> = ({ tasks }) => {
             </div>
             <div className="p-6 space-y-4">
                 {employees.map(emp => {
-                    const empTasks = tasks.filter(t => t.assignee === emp.name && t.status !== 'DONE');
+                    const empTasks = tasks.filter(t => t.assignees.includes(emp.name) && t.status !== 'DONE');
                     const count = empTasks.length;
                     // Simple logic for load color
                     const color = count > 5 ? 'bg-red-500' : count > 2 ? 'bg-amber-500' : 'bg-emerald-500';
@@ -1207,8 +1379,9 @@ const KanbanBoard: React.FC<{
     onDelete: (id: string) => void,
     onAddComment: (id: string, text: string) => void,
     currentUser: UserSession,
-    onToggleStatus: (task: Task) => void
-}> = ({ tasks, userRole, onDelete, onAddComment, currentUser, onToggleStatus }) => {
+    onToggleStatus: (task: Task) => void,
+    onUpdateProgress: (task: Task, progress: number) => void
+}> = ({ tasks, userRole, onDelete, onAddComment, currentUser, onToggleStatus, onUpdateProgress }) => {
     
     // Expanded task state for viewing details/comments
     const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
@@ -1229,6 +1402,8 @@ const KanbanBoard: React.FC<{
         onAddComment(taskId, commentText);
         setCommentText('');
     };
+
+    const boardHeight = userRole === 'BOSS' ? 'h-[600px]' : 'h-[calc(100vh-12rem)]';
 
     const getPriorityStyles = (p: PriorityLevel) => {
         switch (p) {
@@ -1260,7 +1435,8 @@ const KanbanBoard: React.FC<{
                         filteredTasks.map(task => {
                             const styles = getPriorityStyles(task.priority);
                             const isExpanded = expandedTaskId === task.id;
-                            const isMyTask = task.assignee === currentUser.name;
+                            const isMyTask = task.assignees.includes(currentUser.name);
+                            const progress = task.progress || 0;
                             
                             return (
                                 <div key={task.id} className={`rounded-xl shadow-sm border border-slate-200 ${styles.border} ${task.status === 'DONE' ? 'bg-slate-50 opacity-75' : styles.bg} transition-all duration-200 ${isExpanded ? 'ring-2 ring-blue-500/20 shadow-md' : 'hover:shadow-md hover:border-blue-200'}`}>
@@ -1287,7 +1463,7 @@ const KanbanBoard: React.FC<{
                                                         <CheckCircle2 className="w-4 h-4" />
                                                     </button>
                                                 )}
-                                                {userRole === 'BOSS' && (
+                                                {(userRole === 'BOSS' || isMyTask) && (
                                                     <button onClick={(e) => { e.stopPropagation(); onDelete(task.id); }} className="p-1 text-slate-300 hover:text-red-500 transition-colors">
                                                         <Trash2 className="w-4 h-4" />
                                                     </button>
@@ -1301,12 +1477,40 @@ const KanbanBoard: React.FC<{
                                             <p className="text-xs text-slate-500 line-clamp-2 mb-3 bg-slate-50 p-2 rounded border border-slate-100">{task.justification}</p>
                                         )}
 
+                                        {/* Progress Bar */}
+                                        <div className="mb-2" onClick={(e) => e.stopPropagation()}>
+                                            <div className="flex justify-between text-[10px] text-slate-500 mb-1">
+                                                <span>Progresso</span>
+                                                <span className="font-bold">{progress}%</span>
+                                            </div>
+                                            <div className="w-full bg-slate-100 rounded-full h-2 relative group">
+                                                <div className={`h-2 rounded-full transition-all duration-300 ${progress === 100 ? 'bg-green-500' : 'bg-blue-600'}`} style={{ width: `${progress}%` }}></div>
+                                                {/* Slider Input (Visible on Hover or if My Task) */}
+                                                {(isMyTask || userRole === 'BOSS') && (
+                                                    <input 
+                                                        type="range" 
+                                                        min="0" max="100" step="10" 
+                                                        value={progress}
+                                                        onChange={(e) => onUpdateProgress(task, parseInt(e.target.value))}
+                                                        className="absolute top-0 left-0 w-full h-full opacity-0 cursor-pointer"
+                                                        title="Arraste para alterar o progresso"
+                                                    />
+                                                )}
+                                            </div>
+                                        </div>
+
                                         <div className="flex items-center justify-between mt-3 pt-3 border-t border-slate-100">
                                             <div className={`flex items-center gap-2 ${isMyTask ? 'bg-yellow-100 px-2 py-1 rounded-full -ml-2' : ''}`}>
-                                                <div className="w-6 h-6 rounded-full bg-slate-100 text-slate-600 flex items-center justify-center text-xs font-bold border border-slate-200" title={task.assignee}>
-                                                    {task.assignee.charAt(0)}
+                                                <div className="flex -space-x-2">
+                                                    {task.assignees.map((assignee, idx) => (
+                                                        <div key={idx} className="w-6 h-6 rounded-full bg-slate-100 text-slate-600 flex items-center justify-center text-xs font-bold border border-slate-200 ring-2 ring-white" title={assignee}>
+                                                            {assignee.charAt(0)}
+                                                        </div>
+                                                    ))}
                                                 </div>
-                                                <span className={`text-xs font-medium ${isMyTask ? 'text-blue-900 font-bold' : 'text-slate-600'}`}>{task.assignee} {isMyTask && '(Você)'}</span>
+                                                <span className={`text-xs font-medium ml-1 ${isMyTask ? 'text-blue-900 font-bold' : 'text-slate-600'}`}>
+                                                    {task.assignees.length === 1 ? task.assignees[0] : `${task.assignees.length} Resp.`} {isMyTask && '(Você)'}
+                                                </span>
                                             </div>
                                             <div className="flex items-center gap-2">
                                                  {task.comments.length > 0 && (
@@ -1336,9 +1540,9 @@ const KanbanBoard: React.FC<{
                                                         <p className="text-xs text-slate-400 italic text-center py-2">Nenhum comentário ainda.</p>
                                                     ) : (
                                                         task.comments.map(comment => (
-                                                            <div key={comment.id} className={`flex flex-col ${comment.author === currentUser.name ? 'items-end' : 'items-start'}`}>
-                                                                <div className={`max-w-[85%] rounded-lg p-2 text-xs ${comment.author === currentUser.name ? 'bg-blue-100 text-blue-900' : 'bg-white border border-slate-200 text-slate-700'}`}>
-                                                                    <div className="font-bold mb-0.5 text-[10px] opacity-70">{comment.author}</div>
+                                                            <div key={comment.id} className={`flex flex-col ${comment.author === currentUser.name ? 'items-end' : 'items-start'} mb-2`}>
+                                                                <div className={`p-2 rounded-lg max-w-[90%] text-xs ${comment.author === currentUser.name ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-700'}`}>
+                                                                    <span className="font-bold block text-[10px] mb-0.5">{comment.author}</span>
                                                                     {comment.text}
                                                                 </div>
                                                                 <span className="text-[9px] text-slate-400 mt-0.5">há {Math.floor((Date.now() - comment.createdAt)/60000)} min</span>
@@ -1346,7 +1550,6 @@ const KanbanBoard: React.FC<{
                                                         ))
                                                     )}
                                                 </div>
-
                                                 <div className="flex gap-2">
                                                     <input 
                                                         type="text" 
@@ -1377,7 +1580,7 @@ const KanbanBoard: React.FC<{
     };
 
     return (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 h-[calc(100vh-8rem)]">
+        <div className={`grid grid-cols-1 md:grid-cols-3 gap-6 ${boardHeight}`}>
             <div className="h-full">
                 {renderColumn(PriorityLevel.ALTA, 'Prioridade Alta', <AlertCircle className="w-4 h-4 text-red-600" />)}
             </div>

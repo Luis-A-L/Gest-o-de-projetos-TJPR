@@ -25,9 +25,10 @@ export interface Task {
   priority: PriorityLevel;
   justification: string;
   project: string;
-  assignee: string;
+  assignees: string[];
   createdAt: number;
   comments: Comment[];
+  progress?: number;
 }
 
 export interface PrioritizationResult {
