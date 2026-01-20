@@ -386,19 +386,20 @@ const App: React.FC = () => {
     try {
       setNotification({ type: 'loading', message: 'Salvando demanda...' });
       
-      const { data, error } = await supabase
-        .from('tasks')
-        .insert([{
+      const payload = {
           title: newTask.title,
           category: newTask.category,
           priority: newTask.priority,
           justification: newTask.justification,
           project: newTask.project,
           assignees: newTask.assignees,
-          assignee: newTask.assignees[0], // Preenche coluna legada para evitar erro de constraint
-          progress: 0,
-          created_by: currentUser?.name
-        }])
+          assignee: newTask.assignees.length > 0 ? newTask.assignees[0] : (currentUser?.name || 'Desconhecido'), // Fallback para evitar erro de constraint
+          progress: 0
+      };
+
+      const { data, error } = await supabase
+        .from('tasks')
+        .insert([payload])
         .select()
         .single();
 
@@ -410,8 +411,7 @@ const App: React.FC = () => {
             id: data.id,
             createdAt: new Date(data.created_at).getTime(),
             progress: 0,
-            comments: [],
-            createdBy: currentUser?.name
+            comments: []
         } as any;
         
         setTasks(prev => [createdTask, ...prev]);
@@ -444,7 +444,7 @@ const App: React.FC = () => {
       }
     } catch (err) {
       console.error("Error adding task:", err);
-      setNotification({ type: 'error', message: `Erro ao criar tarefa: ${(err as any).message}` });
+      setNotification({ type: 'error', message: `Erro ao criar tarefa: ${(err as any).message || (err as any).details || 'Erro desconhecido'}` });
     }
   };
 
@@ -1387,6 +1387,10 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
       const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
         if (!formData.title.trim()) return;
+        if (!formData.project) {
+            alert("Por favor, selecione ou crie um projeto.");
+            return;
+        }
     
         const newTask: Task = {
           id: '', 
