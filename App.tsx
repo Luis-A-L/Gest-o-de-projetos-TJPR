@@ -702,6 +702,38 @@ const App: React.FC = () => {
     }
   };
 
+  const handleRemoveAssignee = async (taskId: string, assigneeToRemove: string) => {
+    // Optimistic Update
+    setTasks(prev => prev.map(t => {
+        if (t.id === taskId) {
+            return { ...t, assignees: t.assignees.filter(a => a !== assigneeToRemove) };
+        }
+        return t;
+    }));
+
+    try {
+        const task = tasks.find(t => t.id === taskId);
+        if (!task) return;
+
+        const newAssignees = task.assignees.filter(a => a !== assigneeToRemove);
+
+        const { error } = await supabase
+            .from('tasks')
+            .update({ assignees: newAssignees })
+            .eq('id', taskId);
+
+        if (error) throw error;
+
+        setNotification({ type: 'success', message: `${assigneeToRemove} removido da demanda.` });
+        logActivity(taskId, `removeu ${assigneeToRemove} da demanda`);
+
+    } catch (err) {
+        console.error("Error removing assignee:", err);
+        setNotification({ type: 'error', message: 'Erro ao remover responsável.' });
+        fetchTasks(); // Revert on error
+    }
+  };
+
   const generateReport = () => {
     if (!tasks.length) {
       setNotification({ type: 'error', message: 'Não há tarefas para gerar relatório.' });
@@ -905,6 +937,7 @@ const App: React.FC = () => {
                     onUpdatePriority={handleUpdatePriority}
                     onMoveTask={handleMoveTask}
                     onAddAssignee={handleAddAssignee}
+                    onRemoveAssignee={handleRemoveAssignee}
                 />
             )}
         </div>
@@ -1484,7 +1517,7 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 mb-1.5">Categoria</label>
                   <select name="category" value={formData.category} onChange={handleInputChange} className={inputClasses}>
-                    {Object.values(Category).map(c => <option key={c} value={c}>{c}</option>)}
+                    {Object.values(Category).filter(c => c !== 'INFRA').map(c => <option key={c} value={c}>{c}</option>)}
                   </select>
                 </div>
                 <div>
@@ -1668,8 +1701,9 @@ const KanbanBoard: React.FC<{
     onUpdateProgress: (task: Task, progress: number) => void,
     onUpdatePriority: (task: Task, priority: PriorityLevel) => void,
     onMoveTask: (taskId: string, newAssignee: string, oldAssignee: string) => void,
-    onAddAssignee: (taskId: string, newAssigneeName: string) => void
-}> = ({ tasks, userRole, onDelete, onAddComment, currentUser, onToggleStatus, onUpdateProgress, onUpdatePriority, onMoveTask, onAddAssignee }) => {
+    onAddAssignee: (taskId: string, newAssigneeName: string) => void,
+    onRemoveAssignee: (taskId: string, assigneeToRemove: string) => void
+}> = ({ tasks, userRole, onDelete, onAddComment, currentUser, onToggleStatus, onUpdateProgress, onUpdatePriority, onMoveTask, onAddAssignee, onRemoveAssignee }) => {
     
     // Expanded task state for viewing details/comments
     const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
@@ -1919,8 +1953,18 @@ const KanbanBoard: React.FC<{
                                                 </h5>
                                                 <div className="flex flex-wrap gap-2">
                                                     {task.assignees.map(assignee => (
-                                                        <span key={assignee} className="bg-white border border-slate-200 text-slate-600 px-2 py-1 rounded text-xs flex items-center gap-1 shadow-sm">
+                                                        <span key={assignee} className="bg-white border border-slate-200 text-slate-600 px-2 py-1 rounded text-xs flex items-center gap-1 shadow-sm group/tag">
                                                             {assignee}
+                                                            <button 
+                                                                onClick={(e) => {
+                                                                    e.stopPropagation();
+                                                                    onRemoveAssignee(task.id, assignee);
+                                                                }}
+                                                                className="text-slate-400 hover:text-red-500 ml-1 opacity-0 group-hover/tag:opacity-100 transition-opacity"
+                                                                title="Remover"
+                                                            >
+                                                                <X className="w-3 h-3" />
+                                                            </button>
                                                         </span>
                                                     ))}
                                                     {availableAssignees.length > 0 && (
@@ -2030,7 +2074,7 @@ const KanbanBoard: React.FC<{
                             className="pl-9 pr-8 py-1.5 text-xs border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none w-full md:w-36 appearance-none bg-white shadow-sm cursor-pointer"
                         >
                             <option value="ALL">Todas Categorias</option>
-                            {Object.values(Category).map(c => <option key={c} value={c}>{c}</option>)}
+                            {Object.values(Category).filter(c => c !== 'INFRA').map(c => <option key={c} value={c}>{c}</option>)}
                         </select>
                     </div>
 
