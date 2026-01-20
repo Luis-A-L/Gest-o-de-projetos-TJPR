@@ -25,7 +25,9 @@ import {
   X,
   BarChart3,
   FileText,
-  Download
+  Download,
+  Search,
+  Filter
 } from 'lucide-react';
 
 // --- CONFIGURATION ---
@@ -44,6 +46,30 @@ const DEFAULT_PROJECTS = [
   'Sistema de Triagem (Em Desenv.)', 
   'Módulo de Prazos (Manutenção)'
 ];
+
+// --- SHARED UTILS ---
+
+// Função compartilhada para envio de e-mail via Edge Function
+const sendSystemEmail = async (toEmail: string, toName: string, subject: string, htmlBody: string) => {
+    // MODO DE DESENVOLVIMENTO (RESEND FREE TIER)
+    // Redireciona para evitar erro 400 se o domínio não for verificado
+    const SAFE_DESTINATION = '11804338907@tjpr.jus.br';
+
+    const { data, error } = await supabase.functions.invoke('send-email', {
+        body: {
+            to: SAFE_DESTINATION,
+            subject: subject,
+            html: `<div style="font-family: sans-serif; color: #333;">
+                    <p style="background: #fff3cd; color: #856404; padding: 8px; border-radius: 4px; font-size: 11px;"><strong>Debug:</strong> Para: ${toEmail}</p>
+                    ${htmlBody}
+                   </div>`
+        }
+    });
+
+    if (error) throw error;
+    if (data?.error) throw new Error(data.error);
+    return data;
+};
 
 // --- TYPES FOR VIEW STATE ---
 type UserRole = 'BOSS' | 'EMPLOYEE';
@@ -71,6 +97,13 @@ const App: React.FC = () => {
   const [notificationsList, setNotificationsList] = useState<NotificationItem[]>([]);
   const [projects, setProjects] = useState<string[]>(DEFAULT_PROJECTS);
   const [showNotificationsPanel, setShowNotificationsPanel] = useState(false);
+
+  // Sound Effect
+  const playNotificationSound = () => {
+    const audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3');
+    audio.volume = 0.5;
+    audio.play().catch(e => console.error("Erro ao tocar som:", e));
+  };
 
   // Notification / Toast System
   const [notification, setNotification] = useState<{message: string, type: 'success' | 'loading' | 'error'} | null>(null);
@@ -102,13 +135,20 @@ const App: React.FC = () => {
         const subscription = supabase
           .channel('public:notifications')
           .on('postgres_changes', { 
-            event: 'INSERT', 
+            event: '*', 
             schema: 'public', 
             table: 'notifications',
             filter: `user_email=eq.${currentUser.email}`
           }, (payload) => {
-            setNotificationsList(prev => [payload.new as NotificationItem, ...prev]);
-            // Opcional: Tocar um som ou mostrar toast pequeno
+            if (payload.eventType === 'INSERT') {
+                setNotificationsList(prev => [payload.new as NotificationItem, ...prev]);
+                setNotification({ type: 'success', message: 'Nova notificação recebida' });
+                playNotificationSound();
+            } else if (payload.eventType === 'UPDATE') {
+                setNotificationsList(prev => prev.map(n => n.id === payload.new.id ? (payload.new as NotificationItem) : n));
+            } else if (payload.eventType === 'DELETE') {
+                setNotificationsList(prev => prev.filter(n => n.id !== payload.old.id));
+            }
           })
           .subscribe();
 
@@ -117,9 +157,26 @@ const App: React.FC = () => {
           .channel('public:tasks')
           .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks' }, (payload) => {
              if (payload.eventType === 'INSERT') {
-                // Logic handled by optimistic update usually, but good to sync
-                // For simplicity in this view, we might want to refetch or append if not exists
-                // fetchTasks(); // Brute force sync for simplicity on INSERT
+                const t = payload.new;
+                const newTask: Task = {
+                    id: t.id,
+                    title: t.title,
+                    category: t.category as Category,
+                    priority: t.priority as PriorityLevel,
+                    justification: t.justification,
+                    project: t.project,
+                    assignees: t.assignees || (t.assignee ? [t.assignee] : []),
+                    createdAt: new Date(t.created_at).getTime(),
+                    status: t.status || 'PENDING',
+                    progress: t.progress || 0,
+                    comments: []
+                };
+                
+                setTasks(prev => {
+                    if (prev.some(existing => existing.id === newTask.id)) return prev;
+                    return [newTask, ...prev];
+                });
+                playNotificationSound();
              } else if (payload.eventType === 'UPDATE') {
                 setTasks(prev => prev.map(t => {
                     if (t.id === payload.new.id) {
@@ -127,14 +184,17 @@ const App: React.FC = () => {
                             ...t, 
                             ...payload.new,
                             // Preserve comments and mapped fields that might differ in structure
-                            category: payload.new.category as Category,
-                            priority: payload.new.priority as PriorityLevel,
-                            createdAt: new Date(payload.new.created_at).getTime(),
+                            category: (payload.new.category as Category) || t.category,
+                            priority: (payload.new.priority as PriorityLevel) || t.priority,
+                            createdAt: payload.new.created_at ? new Date(payload.new.created_at).getTime() : t.createdAt,
+                            assignees: payload.new.assignees || (payload.new.assignee ? [payload.new.assignee] : t.assignees),
                             comments: t.comments // Keep existing comments
                         };
                     }
                     return t;
                 }));
+             } else if (payload.eventType === 'DELETE') {
+                setTasks(prev => prev.filter(t => t.id !== payload.old.id));
              }
           })
           .subscribe();
@@ -210,6 +270,7 @@ const App: React.FC = () => {
           project: t.project,
           assignees: t.assignees || (t.assignee ? [t.assignee] : []),
           createdAt: new Date(t.created_at).getTime(),
+          createdBy: t.created_by,
           status: t.status || 'PENDING',
           progress: t.progress || 0,
           comments: t.comments ? t.comments.map((c: any) => ({
@@ -240,7 +301,8 @@ const App: React.FC = () => {
     localStorage.setItem('tjpr_session', JSON.stringify(session));
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
     setCurrentUser(null);
     localStorage.removeItem('tjpr_session');
     setTasks([]);
@@ -270,35 +332,19 @@ const App: React.FC = () => {
     setNotification({ type: 'loading', message: `Enviando notificação para ${toName}...` });
     
     try {
-        // --- FIX: MODO DE DESENVOLVIMENTO (RESEND FREE TIER) ---
-        // Redireciona todos os e-mails para o endereço verificado para evitar erro 400 ao criar tarefas/comentários
-        const SAFE_DESTINATION = '11804338907@tjpr.jus.br';
-
-        const { data, error } = await supabase.functions.invoke('send-email', {
-          body: {
-            to: SAFE_DESTINATION,
-            subject: `[TJPR-IA] ${title} (Para: ${toName})`,
-            html: `
-              <div style="font-family: sans-serif; padding: 20px; color: #333;">
-                <p style="background: #fff3cd; color: #856404; padding: 8px; border-radius: 4px; font-size: 11px; margin-bottom: 15px;">
-                    <strong>Modo Debug:</strong> E-mail redirecionado. Destinatário original: ${toEmail}
-                </p>
+        await sendSystemEmail(
+            toEmail,
+            toName,
+            `[TJPR-IA] ${title}`,
+            `
                 <h2 style="color: #1e3a8a;">TJPR Gestão de IA</h2>
                 <p>Olá <strong>${toName}</strong>,</p>
                 <p>${message.replace(/\n/g, '<br>')}</p>
                 <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
                 <p style="font-size: 12px; color: #666;">Enviado automaticamente pelo sistema de gestão.</p>
-              </div>
             `
-          }
-        });
-
-        if (error) throw error;
-        
-        // Verifica erro retornado pela função (Soft Error)
-        if (data?.error) throw new Error(data.error);
-
-        setNotification({ type: 'success', message: `Notificação enviada (Redirecionada para Debug)` });
+        );
+        setNotification({ type: 'success', message: `Notificação enviada.` });
     } catch (error: any) {
         console.error('Falha ao enviar email via Edge Function:', error);
         setNotification({ type: 'error', message: `Erro ao enviar e-mail: ${error.message}` });
@@ -350,7 +396,8 @@ const App: React.FC = () => {
           project: newTask.project,
           assignees: newTask.assignees,
           assignee: newTask.assignees[0], // Preenche coluna legada para evitar erro de constraint
-          progress: 0
+          progress: 0,
+          created_by: currentUser?.name
         }])
         .select()
         .single();
@@ -363,8 +410,9 @@ const App: React.FC = () => {
             id: data.id,
             createdAt: new Date(data.created_at).getTime(),
             progress: 0,
-            comments: []
-        };
+            comments: [],
+            createdBy: currentUser?.name
+        } as any;
         
         setTasks(prev => [createdTask, ...prev]);
         
@@ -379,7 +427,7 @@ const App: React.FC = () => {
             await sendInAppNotification(
               email,
               `Nova Demanda: ${newTask.title}`,
-              `Você foi atribuído ao projeto "${newTask.project}" com prioridade ${newTask.priority}.`
+              `Criada por: ${currentUser?.name}. Você foi atribuído ao projeto "${newTask.project}" com prioridade ${newTask.priority}.`
             );
         }
 
@@ -416,6 +464,9 @@ const App: React.FC = () => {
         
         if (newStatus === 'DONE') {
             setNotification({ type: 'success', message: 'Tarefa concluída!' });
+            logActivity(task.id, 'concluiu a tarefa');
+        } else {
+            logActivity(task.id, 'reabriu a tarefa');
         }
     } catch (err) {
         console.error("Error updating status:", err);
@@ -426,6 +477,7 @@ const App: React.FC = () => {
   };
 
   const handleUpdatePriority = async (task: Task, newPriority: PriorityLevel) => {
+    const oldPriority = task.priority;
     // Optimistic Update
     setTasks(prev => prev.map(t => t.id === task.id ? { ...t, priority: newPriority } : t));
 
@@ -437,6 +489,7 @@ const App: React.FC = () => {
 
         if (error) throw error;
         setNotification({ type: 'success', message: 'Prioridade atualizada.' });
+        logActivity(task.id, `alterou a prioridade de ${oldPriority} para ${newPriority}`);
     } catch (err) {
         console.error("Error updating priority:", err);
         setTasks(prev => prev.map(t => t.id === task.id ? { ...t, priority: task.priority } : t));
@@ -529,27 +582,27 @@ const App: React.FC = () => {
 
             const task = tasks.find(t => t.id === taskId);
             if (task) {
-                const recipients: {email: string, name: string}[] = [];
-
-                if (currentUser.role === 'BOSS') {
-                    // Boss commented -> Notify All Assignees
-                    task.assignees.forEach(assigneeName => {
-                        const entry = Object.entries(ALLOWED_USERS).find(([email, u]) => u.name === assigneeName);
-                        if (entry) {
-                            recipients.push({ email: entry[0], name: assigneeName });
-                        }
-                    });
-                } else {
-                    // Employee commented -> Notify Boss
-                    recipients.push({ email: BOSS_EMAIL, name: "Rodrigo Louzano" });
-                }
+                // Notify logic: Boss + Assignees - Current User
+                const recipients = new Set<string>();
                 
-                for (const recipient of recipients) {
-                   // Send In-App Notification
+                // Always notify Boss (if not current user)
+                if (currentUser.role !== 'BOSS') {
+                    recipients.add(BOSS_EMAIL);
+                }
+
+                // Notify Assignees
+                task.assignees.forEach(assigneeName => {
+                    const entry = Object.entries(ALLOWED_USERS).find(([email, u]) => u.name === assigneeName);
+                    if (entry && entry[0] !== currentUser.email) {
+                        recipients.add(entry[0]);
+                    }
+                });
+
+                for (const email of Array.from(recipients)) {
                    await sendInAppNotification(
-                      recipient.email,
-                      `Novo Comentário em: ${task.title}`,
-                      `${currentUser.name} comentou: "${text}"`
+                      email,
+                      `Atualização em: ${task.title}`,
+                      `${currentUser.name}: ${text}`
                    );
                 }
             }
@@ -557,6 +610,95 @@ const App: React.FC = () => {
     } catch (err) {
         console.error("Error adding comment:", err);
         setNotification({ type: 'error', message: 'Erro ao adicionar comentário.' });
+    }
+  };
+
+  // Helper for logging activity
+  const logActivity = async (taskId: string, action: string) => {
+      // We use handleAddComment to insert the log and trigger notifications
+      await handleAddComment(taskId, `🔄 ${action}`);
+  };
+
+  const handleMoveTask = async (taskId: string, newAssignee: string, oldAssignee: string) => {
+    // Optimistic Update
+    setTasks(prev => prev.map(t => {
+        if (t.id === taskId) {
+            const newAssignees = t.assignees.filter(a => a !== oldAssignee);
+            if (!newAssignees.includes(newAssignee)) {
+                newAssignees.push(newAssignee);
+            }
+            return { ...t, assignees: newAssignees };
+        }
+        return t;
+    }));
+
+    try {
+        const task = tasks.find(t => t.id === taskId);
+        if (!task) return;
+
+        const newAssignees = task.assignees.filter(a => a !== oldAssignee);
+        if (!newAssignees.includes(newAssignee)) {
+            newAssignees.push(newAssignee);
+        }
+
+        const { error } = await supabase
+            .from('tasks')
+            .update({ assignees: newAssignees, assignee: newAssignees[0] })
+            .eq('id', taskId);
+
+        if (error) throw error;
+        
+        setNotification({ type: 'success', message: `Tarefa movida para ${newAssignee}` });
+        logActivity(taskId, `moveu a tarefa de ${oldAssignee} para ${newAssignee}`);
+
+    } catch (err) {
+        console.error("Error moving task:", err);
+        setNotification({ type: 'error', message: 'Erro ao mover tarefa.' });
+        fetchTasks();
+    }
+  };
+
+  const handleAddAssignee = async (taskId: string, newAssigneeName: string) => {
+    // Optimistic Update
+    setTasks(prev => prev.map(t => {
+        if (t.id === taskId && !t.assignees.includes(newAssigneeName)) {
+            return { ...t, assignees: [...t.assignees, newAssigneeName] };
+        }
+        return t;
+    }));
+
+    try {
+        const task = tasks.find(t => t.id === taskId);
+        if (!task) return;
+        
+        if (task.assignees.includes(newAssigneeName)) return;
+
+        const newAssignees = [...task.assignees, newAssigneeName];
+
+        const { error } = await supabase
+            .from('tasks')
+            .update({ assignees: newAssignees })
+            .eq('id', taskId);
+
+        if (error) throw error;
+
+        setNotification({ type: 'success', message: `${newAssigneeName} incluído na demanda.` });
+        logActivity(taskId, `incluiu ${newAssigneeName} na demanda`);
+        
+        // Notify the new assignee
+        const entry = Object.entries(ALLOWED_USERS).find(([email, u]) => u.name === newAssigneeName);
+        if (entry) {
+             await sendInAppNotification(
+              entry[0],
+              `Nova Atribuição: ${task.title}`,
+              `Você foi incluído na demanda por ${currentUser?.name}.`
+            );
+        }
+
+    } catch (err) {
+        console.error("Error adding assignee:", err);
+        setNotification({ type: 'error', message: 'Erro ao adicionar responsável.' });
+        fetchTasks(); // Revert on error
     }
   };
 
@@ -761,6 +903,8 @@ const App: React.FC = () => {
                     onToggleStatus={handleToggleTaskStatus}
                     onUpdateProgress={handleUpdateProgress}
                     onUpdatePriority={handleUpdatePriority}
+                    onMoveTask={handleMoveTask}
+                    onAddAssignee={handleAddAssignee}
                 />
             )}
         </div>
@@ -773,7 +917,9 @@ const App: React.FC = () => {
 
 const LoginScreen: React.FC<{ onLoginSuccess: (session: UserSession) => void }> = ({ onLoginSuccess }) => {
     const [step, setStep] = useState<'EMAIL' | 'PASSWORD' | 'CREATE_PASSWORD'>('EMAIL');
+    const [authTab, setAuthTab] = useState<'LOGIN' | 'REGISTER'>('LOGIN');
     const [email, setEmail] = useState('');
+    const [name, setName] = useState('');
     const [password, setPassword] = useState('');
     const [confirmPassword, setConfirmPassword] = useState('');
     const [error, setError] = useState('');
@@ -825,24 +971,25 @@ const LoginScreen: React.FC<{ onLoginSuccess: (session: UserSession) => void }> 
         setLoading(true);
 
         try {
-            const { data } = await supabase
-                .from('profiles')
-                .select('*')
-                .eq('email', email.toLowerCase())
-                .single();
+            const { data, error } = await supabase.auth.signInWithPassword({
+                email: email,
+                password: password,
+            });
+
+            if (error) throw error;
             
-            if (data && data.password === password) {
-                // SUCCESS
+            if (data.user) {
+                const name = data.user.user_metadata.name || identifiedUser?.name;
+                const role = data.user.user_metadata.role || identifiedUser?.role;
+
                 onLoginSuccess({
-                    name: data.name,
-                    email: data.email,
-                    role: data.role as UserRole
+                    name: name,
+                    email: data.user.email!,
+                    role: role as UserRole
                 });
-            } else {
-                setError('Senha incorreta.');
             }
-        } catch (err) {
-            setError('Erro ao realizar login.');
+        } catch (err: any) {
+            setError(err.message || 'Erro ao realizar login.');
         } finally {
             setLoading(false);
         }
@@ -850,8 +997,8 @@ const LoginScreen: React.FC<{ onLoginSuccess: (session: UserSession) => void }> 
 
     const handleRegister = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (password.length < 4) {
-            setError('A senha deve ter pelo menos 4 caracteres.');
+        if (password.length < 6) {
+            setError('A senha deve ter pelo menos 6 caracteres.');
             return;
         }
         if (password !== confirmPassword) {
@@ -863,36 +1010,98 @@ const LoginScreen: React.FC<{ onLoginSuccess: (session: UserSession) => void }> 
         setLoading(true);
 
         try {
+            // Determina nome e role (prioriza lista de permitidos, senão usa o input manual)
             const userData = ALLOWED_USERS[email.toLowerCase()];
+            const finalName = userData?.name || name;
+            const finalRole = userData?.role || 'EMPLOYEE';
+
+            if (!finalName) {
+                throw new Error('Por favor, informe seu nome.');
+            }
             
-            const { error: insertError } = await supabase
-                .from('profiles')
-                .insert({
-                    email: email.toLowerCase(),
-                    password: password, // In production, use hashing!
-                    name: userData.name,
-                    role: userData.role
-                });
-
-            if (insertError) throw insertError;
-
-            // Auto login after register
-            onLoginSuccess({
-                name: userData.name,
-                email: email.toLowerCase(),
-                role: userData.role
+            const { data, error } = await supabase.auth.signUp({
+                email: email,
+                password: password,
+                options: {
+                    data: {
+                        name: finalName,
+                        role: finalRole
+                    }
+                }
             });
 
-        } catch (err) {
+            if (error) {
+                // Se o usuário já existir no Auth mas não no Profile, tentamos logar e criar o profile
+                if (error.message?.includes('already registered') || error.status === 400 || error.status === 422) {
+                    const { data: loginData, error: loginError } = await supabase.auth.signInWithPassword({
+                        email: email,
+                        password: password,
+                    });
+
+                    if (loginError) {
+                        throw new Error('Usuário já cadastrado no sistema, mas a senha informada está incorreta.');
+                    }
+
+                    if (loginData.user) {
+                        // Recria o perfil se o login funcionar
+                        await supabase.from('profiles').upsert({
+                            email: email.toLowerCase(),
+                            name: finalName,
+                            role: finalRole
+                        }, { onConflict: 'email' });
+
+                        onLoginSuccess({
+                            name: finalName,
+                            email: email.toLowerCase(),
+                            role: finalRole
+                        });
+                        return;
+                    }
+                }
+                throw error;
+            }
+
+            // Sincroniza com a tabela profiles para manter compatibilidade com o resto do app
+            if (data.user) {
+                 await supabase.from('profiles').upsert({
+                    email: email.toLowerCase(),
+                    name: finalName,
+                    role: finalRole
+                }, { onConflict: 'email' });
+
+                onLoginSuccess({
+                    name: finalName,
+                    email: email.toLowerCase(),
+                    role: finalRole
+                });
+            }
+
+        } catch (err: any) {
             console.error(err);
-            setError('Erro ao criar senha.');
+            setError(err.message || 'Erro ao criar conta.');
         } finally {
             setLoading(false);
         }
     };
 
-    const handleForgotPassword = () => {
-        alert(`Um link de redefinição de senha foi enviado para ${email}. Verifique sua caixa de entrada.`);
+    const handleForgotPassword = async () => {
+        if (!email) {
+            setError('Digite seu e-mail para recuperar a senha.');
+            return;
+        }
+        setLoading(true);
+        try {
+            const { error } = await supabase.auth.resetPasswordForEmail(email, {
+                redirectTo: window.location.origin,
+            });
+            if (error) throw error;
+            alert(`E-mail de recuperação enviado para ${email}.`);
+        } catch (err: any) {
+            console.error(err);
+            setError(err.message || 'Erro ao enviar e-mail.');
+        } finally {
+            setLoading(false);
+        }
     };
 
     return (
@@ -918,27 +1127,88 @@ const LoginScreen: React.FC<{ onLoginSuccess: (session: UserSession) => void }> 
                 <div className="p-12 md:w-1/2 flex flex-col justify-center">
                     
                     {step === 'EMAIL' && (
-                        <div className="animate-in fade-in slide-in-from-right-4 duration-300">
-                            <h2 className="text-2xl font-bold text-slate-800 mb-2">Bem-vindo</h2>
-                            <p className="text-slate-500 text-sm mb-6">Selecione seu usuário para entrar:</p>
-                            
-                            <div className="grid grid-cols-2 gap-3 mb-6">
-                                {Object.entries(ALLOWED_USERS).map(([uEmail, uData]) => (
-                                    <button
-                                        key={uEmail}
-                                        onClick={() => handleQuickLogin(uEmail)}
-                                        disabled={loading}
-                                        className="flex flex-col items-center p-3 border border-slate-200 rounded-xl hover:border-blue-500 hover:bg-blue-50 transition-all text-center group bg-white shadow-sm"
-                                    >
-                                        <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm mb-2 transition-colors ${uData.role === 'BOSS' ? 'bg-blue-100 text-blue-700 group-hover:bg-blue-600 group-hover:text-white' : 'bg-slate-100 text-slate-600 group-hover:bg-slate-600 group-hover:text-white'}`}>
-                                            {loading && loadingAuthEmail === uEmail ? <Loader2 className="w-5 h-5 animate-spin" /> : uData.name.charAt(0)}
-                                        </div>
-                                        <span className="text-xs font-bold text-slate-700 group-hover:text-blue-700">{uData.name}</span>
-                                        <span className="text-[10px] text-slate-400">{uData.role === 'BOSS' ? 'Gestor' : 'Colaborador'}</span>
-                                    </button>
-                                ))}
+                        <div className="animate-in fade-in slide-in-from-right-4 duration-300 w-full">
+                            <div className="flex gap-6 mb-6 border-b border-slate-100">
+                                <button 
+                                    onClick={() => setAuthTab('LOGIN')}
+                                    className={`pb-2 text-sm font-bold transition-colors ${authTab === 'LOGIN' ? 'text-blue-700 border-b-2 border-blue-700' : 'text-slate-400 hover:text-slate-600'}`}
+                                >
+                                    Entrar
+                                </button>
+                                <button 
+                                    onClick={() => setAuthTab('REGISTER')}
+                                    className={`pb-2 text-sm font-bold transition-colors ${authTab === 'REGISTER' ? 'text-blue-700 border-b-2 border-blue-700' : 'text-slate-400 hover:text-slate-600'}`}
+                                >
+                                    Criar Conta
+                                </button>
                             </div>
 
+                            {authTab === 'LOGIN' ? (
+                                <>
+                                    <h2 className="text-2xl font-bold text-slate-800 mb-2">Bem-vindo</h2>
+                                    <p className="text-slate-500 text-sm mb-6">Selecione seu usuário para entrar:</p>
+                                    
+                                    <div className="grid grid-cols-2 gap-3 mb-6">
+                                        {Object.entries(ALLOWED_USERS).map(([uEmail, uData]) => (
+                                            <button
+                                                key={uEmail}
+                                                onClick={() => handleQuickLogin(uEmail)}
+                                                disabled={loading}
+                                                className="flex flex-col items-center p-3 border border-slate-200 rounded-xl hover:border-blue-500 hover:bg-blue-50 transition-all text-center group bg-white shadow-sm"
+                                            >
+                                                <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm mb-2 transition-colors ${uData.role === 'BOSS' ? 'bg-blue-100 text-blue-700 group-hover:bg-blue-600 group-hover:text-white' : 'bg-slate-100 text-slate-600 group-hover:bg-slate-600 group-hover:text-white'}`}>
+                                                    {loading && loadingAuthEmail === uEmail ? <Loader2 className="w-5 h-5 animate-spin" /> : uData.name.charAt(0)}
+                                                </div>
+                                                <span className="text-xs font-bold text-slate-700 group-hover:text-blue-700">{uData.name}</span>
+                                                <span className="text-[10px] text-slate-400">{uData.role === 'BOSS' ? 'Gestor' : 'Colaborador'}</span>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </>
+                            ) : (
+                                <form onSubmit={handleRegister} className="space-y-3">
+                                    <div>
+                                        <label className="block text-xs font-bold text-slate-600 mb-1 uppercase tracking-wide">Nome Completo</label>
+                                        <input 
+                                            type="text" 
+                                            required
+                                            value={name}
+                                            onChange={e => setName(e.target.value)}
+                                            className="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 outline-none"
+                                            placeholder="Seu nome"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-bold text-slate-600 mb-1 uppercase tracking-wide">E-mail</label>
+                                        <input 
+                                            type="email" 
+                                            required
+                                            value={email}
+                                            onChange={e => setEmail(e.target.value)}
+                                            className="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 outline-none"
+                                            placeholder="seu.email@tjpr.jus.br"
+                                        />
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label className="block text-xs font-bold text-slate-600 mb-1 uppercase tracking-wide">Senha</label>
+                                            <input type="password" required value={password} onChange={e => setPassword(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 outline-none" placeholder="******" />
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs font-bold text-slate-600 mb-1 uppercase tracking-wide">Confirmar</label>
+                                            <input type="password" required value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 outline-none" placeholder="******" />
+                                        </div>
+                                    </div>
+                                    <button 
+                                        type="submit" 
+                                        disabled={loading}
+                                        className="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-3 rounded-lg transition-all flex items-center justify-center gap-2 disabled:opacity-70 mt-2"
+                                    >
+                                        {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : 'Cadastrar'}
+                                    </button>
+                                </form>
+                            )}
+                            
                             {error && <p className="text-red-500 text-xs font-medium bg-red-50 p-2 rounded flex items-center gap-2 mt-4"><AlertCircle className="w-3 h-3" /> {error}</p>}
                         </div>
                     )}
@@ -1246,7 +1516,7 @@ const CreateTaskForm: React.FC<{ onAddTask: (t: Task) => void, projects: string[
               </div>
 
               <p className="text-[10px] text-center text-slate-400">
-                *A notificação será enviada para o responsável!
+                *O e-mail será enviado automaticamente
               </p>
             </form>
           </div>
@@ -1396,12 +1666,19 @@ const KanbanBoard: React.FC<{
     currentUser: UserSession,
     onToggleStatus: (task: Task) => void,
     onUpdateProgress: (task: Task, progress: number) => void,
-    onUpdatePriority: (task: Task, priority: PriorityLevel) => void
-}> = ({ tasks, userRole, onDelete, onAddComment, currentUser, onToggleStatus, onUpdateProgress, onUpdatePriority }) => {
+    onUpdatePriority: (task: Task, priority: PriorityLevel) => void,
+    onMoveTask: (taskId: string, newAssignee: string, oldAssignee: string) => void,
+    onAddAssignee: (taskId: string, newAssigneeName: string) => void
+}> = ({ tasks, userRole, onDelete, onAddComment, currentUser, onToggleStatus, onUpdateProgress, onUpdatePriority, onMoveTask, onAddAssignee }) => {
     
     // Expanded task state for viewing details/comments
     const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
     const [commentText, setCommentText] = useState('');
+
+    const [viewFilter, setViewFilter] = useState<string>(userRole === 'BOSS' ? 'ALL' : currentUser.name);
+    const [searchTerm, setSearchTerm] = useState('');
+    const [projectFilter, setProjectFilter] = useState('ALL');
+    const [categoryFilter, setCategoryFilter] = useState('ALL');
 
     const toggleExpand = (id: string) => {
         if (expandedTaskId === id) {
@@ -1419,6 +1696,27 @@ const KanbanBoard: React.FC<{
         setCommentText('');
     };
 
+    const handleDragStart = (e: React.DragEvent, taskId: string, currentAssignee: string) => {
+        e.dataTransfer.setData('taskId', taskId);
+        e.dataTransfer.setData('oldAssignee', currentAssignee);
+        e.dataTransfer.effectAllowed = 'move';
+    };
+
+    const handleDragOver = (e: React.DragEvent) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+    };
+
+    const handleDrop = (e: React.DragEvent, targetAssignee: string) => {
+        e.preventDefault();
+        const taskId = e.dataTransfer.getData('taskId');
+        const oldAssignee = e.dataTransfer.getData('oldAssignee');
+        
+        if (taskId && oldAssignee && oldAssignee !== targetAssignee) {
+            onMoveTask(taskId, targetAssignee, oldAssignee);
+        }
+    };
+
     const boardHeight = userRole === 'BOSS' ? 'h-[600px]' : 'h-[calc(100vh-12rem)]';
 
     const getPriorityStyles = (p: PriorityLevel) => {
@@ -1430,35 +1728,91 @@ const KanbanBoard: React.FC<{
         }
     };
 
-    const renderColumn = (priority: PriorityLevel, title: string, icon: React.ReactNode) => {
-        const filteredTasks = tasks.filter(t => t.priority === priority);
+    const employees = Object.values(ALLOWED_USERS).filter(u => u.role === 'EMPLOYEE');
+    const displayedEmployees = viewFilter === 'ALL' ? employees : employees.filter(e => e.name === viewFilter);
+    const allEmployeeNames = employees.map(e => e.name);
+    
+    const allProjects = Array.from(new Set(tasks.map(t => t.project))).filter(Boolean).sort();
+
+    const renderColumn = (assigneeName: string) => {
+        const filteredTasks = tasks.filter(t => {
+            const matchesAssignee = t.assignees.includes(assigneeName);
+            const matchesSearch = t.title.toLowerCase().includes(searchTerm.toLowerCase()) || 
+                                  (t.justification && t.justification.toLowerCase().includes(searchTerm.toLowerCase()));
+            const matchesProject = projectFilter === 'ALL' || t.project === projectFilter;
+            const matchesCategory = categoryFilter === 'ALL' || t.category === categoryFilter;
+            return matchesAssignee && matchesSearch && matchesProject && matchesCategory;
+        });
+        
+        // Ordenar por Prioridade (Alta > Média > Baixa) e depois por Data
+        const priorityWeight = { [PriorityLevel.ALTA]: 3, [PriorityLevel.MEDIA]: 2, [PriorityLevel.BAIXA]: 1 };
+        const sortedTasks = [...filteredTasks].sort((a, b) => {
+             const pDiff = priorityWeight[b.priority] - priorityWeight[a.priority];
+             if (pDiff !== 0) return pDiff;
+             return b.createdAt - a.createdAt;
+        });
         
         return (
-            <div className="flex flex-col h-full bg-slate-100/80 rounded-2xl border border-slate-200/60 overflow-hidden">
+            <div 
+                className="flex flex-col h-full bg-slate-100/80 rounded-2xl border border-slate-200/60 overflow-hidden"
+                onDragOver={handleDragOver}
+                onDrop={(e) => handleDrop(e, assigneeName)}
+            >
                 <div className="flex items-center justify-between p-4 border-b border-slate-200/60 bg-white/50 backdrop-blur-sm">
                     <div className="flex items-center gap-2 text-slate-700 font-semibold">
-                        {icon} <h3>{title}</h3>
+                        <User className="w-4 h-4" /> <h3>{assigneeName}</h3>
                     </div>
                     <span className="bg-white border border-slate-200 text-slate-600 px-2.5 py-0.5 rounded-full text-xs font-bold shadow-sm">{filteredTasks.length}</span>
                 </div>
                 
                 <div className="flex-1 space-y-3 overflow-y-auto p-3 custom-scrollbar">
-                    {filteredTasks.length === 0 ? (
+                    {sortedTasks.length === 0 ? (
                         <div className="h-32 border-2 border-dashed border-slate-200 rounded-lg flex items-center justify-center text-slate-400 text-sm italic">
                             Nenhuma demanda
                         </div>
                     ) : (
-                        filteredTasks.map(task => {
+                        sortedTasks.map(task => {
                             const styles = getPriorityStyles(task.priority);
                             const isExpanded = expandedTaskId === task.id;
                             const isMyTask = task.assignees.includes(currentUser.name);
                             const progress = task.progress || 0;
+                            const availableAssignees = allEmployeeNames.filter(name => !task.assignees.includes(name));
                             
+                            // Lógica de visualização diferenciada
+                            const isBoss = userRole === 'BOSS';
+                            let cardClass = `rounded-xl shadow-sm border border-slate-200 ${styles.border} transition-all duration-200`;
+
+                            if (task.status === 'DONE') {
+                                cardClass += ' bg-slate-50 opacity-75';
+                            } else if (!isBoss && !isMyTask) {
+                                // Tarefa de outro (e não sou chefe) -> Cor diferente (cinza)
+                                cardClass += ' bg-slate-50';
+                            } else {
+                                // Minha tarefa OU sou chefe -> Cor padrão (branca)
+                                cardClass += ` ${styles.bg}`;
+                            }
+
+                            if (isExpanded) {
+                                cardClass += ' ring-2 ring-blue-500/20 shadow-md';
+                            } else {
+                                cardClass += ' hover:shadow-md hover:border-blue-200';
+                            }
+
                             return (
-                                <div key={task.id} className={`rounded-xl shadow-sm border border-slate-200 ${styles.border} ${task.status === 'DONE' ? 'bg-slate-50 opacity-75' : styles.bg} transition-all duration-200 ${isExpanded ? 'ring-2 ring-blue-500/20 shadow-md' : 'hover:shadow-md hover:border-blue-200'}`}>
+                                <div 
+                                    key={task.id} 
+                                    className={`${cardClass} cursor-grab active:cursor-grabbing`}
+                                    draggable={true}
+                                    onDragStart={(e) => handleDragStart(e, task.id, assigneeName)}
+                                >
                                     
                                     {/* Main Card Content - Clickable to Expand */}
                                     <div className="p-4 cursor-pointer" onClick={() => toggleExpand(task.id)}>
+                                        {(task as any).createdBy && (
+                                            <div className="text-[10px] text-slate-400 mb-2 font-medium">
+                                                Criado por: {(task as any).createdBy}
+                                            </div>
+                                        )}
                                         <div className="flex justify-between items-start mb-2">
                                             <div className="flex flex-col">
                                                 <div className="flex items-center gap-1 text-[10px] text-slate-500 font-medium mb-1">
@@ -1494,7 +1848,7 @@ const KanbanBoard: React.FC<{
                                         )}
 
                                         {isExpanded && (
-                                            <div className="mb-3">
+                                            <div className="mb-3" onClick={(e) => e.stopPropagation()}>
                                                 <label className="block text-[10px] font-bold text-slate-500 mb-1 uppercase tracking-wide">Prioridade</label>
                                                 <select
                                                     value={task.priority}
@@ -1559,6 +1913,31 @@ const KanbanBoard: React.FC<{
                                                 <p className="text-sm text-slate-600 bg-white p-3 rounded border border-slate-200">{task.justification}</p>
                                             </div>
 
+                                            <div className="mb-4">
+                                                <h5 className="text-xs font-bold text-slate-700 mb-2 flex items-center gap-1">
+                                                    <User className="w-3 h-3" /> Responsáveis
+                                                </h5>
+                                                <div className="flex flex-wrap gap-2">
+                                                    {task.assignees.map(assignee => (
+                                                        <span key={assignee} className="bg-white border border-slate-200 text-slate-600 px-2 py-1 rounded text-xs flex items-center gap-1 shadow-sm">
+                                                            {assignee}
+                                                        </span>
+                                                    ))}
+                                                    {availableAssignees.length > 0 && (
+                                                        <div className="relative">
+                                                            <select 
+                                                                className="appearance-none bg-blue-50 hover:bg-blue-100 text-blue-600 border border-blue-200 px-2 py-1 rounded text-xs font-bold cursor-pointer outline-none focus:ring-2 focus:ring-blue-500 pr-6 transition-colors"
+                                                                onChange={(e) => { if (e.target.value) { onAddAssignee(task.id, e.target.value); e.target.value = ""; } }}
+                                                                value=""
+                                                            >
+                                                                <option value="" disabled>+ Incluir</option>
+                                                                {availableAssignees.map(name => <option key={name} value={name}>{name}</option>)}
+                                                            </select>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+
                                             <div>
                                                 <h5 className="text-xs font-bold text-slate-700 mb-2 flex items-center gap-1">
                                                     <MessageSquare className="w-3 h-3" /> Comentários ({task.comments.length})
@@ -1609,15 +1988,77 @@ const KanbanBoard: React.FC<{
     };
 
     return (
-        <div className={`grid grid-cols-1 md:grid-cols-3 gap-6 ${boardHeight}`}>
-            <div className="h-full">
-                {renderColumn(PriorityLevel.ALTA, 'Prioridade Alta', <AlertCircle className="w-4 h-4 text-red-600" />)}
+        <div className="flex flex-col h-full">
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 px-1 gap-4">
+                <h3 className="text-lg font-bold text-slate-700 flex items-center gap-2">
+                    <LayoutDashboard className="w-5 h-5 text-blue-600" /> 
+                    {viewFilter === 'ALL' ? 'Visão Geral' : viewFilter === currentUser.name ? 'Minhas Tarefas' : `Tarefas de ${viewFilter}`}
+                </h3>
+                
+                <div className="flex flex-wrap gap-2 w-full md:w-auto items-center">
+                    {/* Search Input */}
+                    <div className="relative flex-1 md:flex-none">
+                        <Search className="absolute left-2.5 top-2 w-4 h-4 text-slate-400" />
+                        <input 
+                            type="text" 
+                            placeholder="Buscar..." 
+                            value={searchTerm}
+                            onChange={(e) => setSearchTerm(e.target.value)}
+                            className="pl-9 pr-3 py-1.5 text-xs border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none w-full md:w-40 shadow-sm"
+                        />
+                    </div>
+
+                    {/* Project Filter */}
+                    <div className="relative flex-1 md:flex-none">
+                        <Filter className="absolute left-2.5 top-2 w-4 h-4 text-slate-400" />
+                        <select 
+                            value={projectFilter}
+                            onChange={(e) => setProjectFilter(e.target.value)}
+                            className="pl-9 pr-8 py-1.5 text-xs border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none w-full md:w-40 appearance-none bg-white shadow-sm cursor-pointer"
+                        >
+                            <option value="ALL">Todos Projetos</option>
+                            {allProjects.map(p => <option key={p} value={p}>{p}</option>)}
+                        </select>
+                    </div>
+
+                    {/* Category Filter */}
+                    <div className="relative flex-1 md:flex-none">
+                        <Filter className="absolute left-2.5 top-2 w-4 h-4 text-slate-400" />
+                        <select 
+                            value={categoryFilter}
+                            onChange={(e) => setCategoryFilter(e.target.value)}
+                            className="pl-9 pr-8 py-1.5 text-xs border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none w-full md:w-36 appearance-none bg-white shadow-sm cursor-pointer"
+                        >
+                            <option value="ALL">Todas Categorias</option>
+                            {Object.values(Category).map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
+                    </div>
+
+                    <div className="flex bg-white border border-slate-200 p-1 rounded-lg shadow-sm overflow-x-auto max-w-full">
+                        <button 
+                            onClick={() => setViewFilter('ALL')}
+                            className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all whitespace-nowrap ${viewFilter === 'ALL' ? 'bg-blue-50 text-blue-700 font-bold' : 'text-slate-500 hover:bg-slate-50'}`}
+                        >
+                            Todos
+                        </button>
+                        {employees.map(emp => (
+                            <button 
+                                key={emp.name}
+                                onClick={() => setViewFilter(emp.name)}
+                                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all whitespace-nowrap ${viewFilter === emp.name ? 'bg-blue-50 text-blue-700 font-bold' : 'text-slate-500 hover:bg-slate-50'}`}
+                            >
+                                {emp.name === currentUser.name ? 'Eu' : emp.name.split(' ')[0]}
+                            </button>
+                        ))}
+                    </div>
+                </div>
             </div>
-            <div className="h-full">
-                {renderColumn(PriorityLevel.MEDIA, 'Prioridade Média', <Clock className="w-4 h-4 text-amber-600" />)}
-            </div>
-            <div className="h-full">
-                {renderColumn(PriorityLevel.BAIXA, 'Prioridade Baixa', <CheckCircle2 className="w-4 h-4 text-emerald-600" />)}
+            <div className={`grid grid-cols-1 ${displayedEmployees.length > 1 ? 'md:grid-cols-3' : 'md:grid-cols-1'} gap-6 ${boardHeight} transition-all`}>
+                {displayedEmployees.map(emp => (
+                    <div key={emp.name} className="h-full min-w-0">
+                        {renderColumn(emp.name)}
+                    </div>
+                ))}
             </div>
         </div>
     );
