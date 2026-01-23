@@ -569,7 +569,7 @@ const App: React.FC = () => {
                 createdAt: new Date(data.created_at).getTime()
             };
 
-            const updatedTasks = tasks.map(t => {
+            setTasks(prev => prev.map(t => {
                 if (t.id === taskId) {
                     return {
                         ...t,
@@ -577,8 +577,7 @@ const App: React.FC = () => {
                     };
                 }
                 return t;
-            });
-            setTasks(updatedTasks);
+            }));
 
             const task = tasks.find(t => t.id === taskId);
             if (task) {
@@ -1717,6 +1716,7 @@ const KanbanBoard: React.FC<{
     const [searchTerm, setSearchTerm] = useState('');
     const [projectFilter, setProjectFilter] = useState('ALL');
     const [categoryFilter, setCategoryFilter] = useState('ALL');
+    const [showFinished, setShowFinished] = useState(false);
 
     const toggleExpand = (id: string) => {
         if (expandedTaskId === id) {
@@ -1779,7 +1779,11 @@ const KanbanBoard: React.FC<{
                                   (t.justification && t.justification.toLowerCase().includes(searchTerm.toLowerCase()));
             const matchesProject = projectFilter === 'ALL' || t.project === projectFilter;
             const matchesCategory = categoryFilter === 'ALL' || t.category === categoryFilter;
-            return matchesAssignee && matchesSearch && matchesProject && matchesCategory;
+            
+            const isDone = t.status === 'DONE';
+            const matchesStatus = showFinished ? isDone : !isDone;
+
+            return matchesAssignee && matchesSearch && matchesProject && matchesCategory && matchesStatus;
         });
         
         // Ordenar por Prioridade (Alta > Média > Baixa) e depois por Data
@@ -1806,7 +1810,7 @@ const KanbanBoard: React.FC<{
                 <div className="flex-1 space-y-3 overflow-y-auto p-3 custom-scrollbar">
                     {sortedTasks.length === 0 ? (
                         <div className="h-32 border-2 border-dashed border-slate-200 rounded-lg flex items-center justify-center text-slate-400 text-sm italic">
-                            Nenhuma demanda
+                            {showFinished ? 'Nenhuma demanda concluída' : 'Nenhuma demanda'}
                         </div>
                     ) : (
                         sortedTasks.map(task => {
@@ -2081,6 +2085,14 @@ const KanbanBoard: React.FC<{
                             {Object.values(Category).filter(c => c !== 'INFRA').map(c => <option key={c} value={c}>{c}</option>)}
                         </select>
                     </div>
+
+                    <button 
+                        onClick={() => setShowFinished(!showFinished)}
+                        className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-all flex items-center gap-2 ${showFinished ? 'bg-green-100 text-green-700 border-green-200' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}
+                    >
+                        <CheckCircle2 className="w-4 h-4" />
+                        {showFinished ? 'Ocultar Finalizados' : 'Ver Finalizados'}
+                    </button>
 
                     <div className="flex bg-white border border-slate-200 p-1 rounded-lg shadow-sm overflow-x-auto max-w-full">
                         <button 
